@@ -306,16 +306,22 @@ impl BuildContext {
 
     /// Lowers `source` into `slot` once, and hands back what is in it.
     ///
-    /// A failure is cached as its message, the way `context` caches a failed
-    /// load: the error is reported once per expansion either way, so every
-    /// `#[data]` still carries it.
+    /// A failure is cached the way `context` caches a failed load: as the
+    /// message, so every `#[data]` after the first still reports it. The
+    /// `BuildError` is formatted *before* it is cached, because `Cached` writes
+    /// its string verbatim — caching the bare `LowerError` would drop the
+    /// `BoltFFI macro lowering failed:` that `Lower` puts in front of it, and
+    /// `render_data` returns before the root expansion could restate it.
     fn memoised<'slot, S: SurfaceLower>(
         slot: &'slot OnceLock<Result<LoweredBindings<S>, String>>,
         source: &SourceContract,
     ) -> Result<&'slot LoweredBindings<S>, BuildError> {
-        slot.get_or_init(|| lower_with_declarations::<S>(source).map_err(|error| error.to_string()))
-            .as_ref()
-            .map_err(|message| BuildError::Cached(message.clone()))
+        slot.get_or_init(|| {
+            lower_with_declarations::<S>(source)
+                .map_err(|error| BuildError::from(error).to_string())
+        })
+        .as_ref()
+        .map_err(|message| BuildError::Cached(message.clone()))
     }
 
     fn render_data_id(
