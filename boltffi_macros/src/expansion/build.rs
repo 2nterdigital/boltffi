@@ -12,8 +12,8 @@ use boltffi_binding::{
     BINDING_EXPANSION_BUILD_ENV, BINDING_EXPANSION_ROOT_ENV, BINDING_EXPANSION_SOURCE_ENV,
     BINDING_EXPANSION_SURFACE_ENV, BINDING_METADATA_BUILD_ENV, BINDING_METADATA_FEATURES_ENV,
     BINDING_METADATA_ROOT_ENV, BINDING_METADATA_SOURCE_ENV, BINDING_METADATA_SURFACE_ENV,
-    BindingMetadataSurface, LowerError, Native, SerializedBindings, Wasm32,
-    lower_with_declarations,
+    BindingMetadataSurface, LowerError, LoweredBindings, Native, SerializedBindings, SurfaceLower,
+    Wasm32, lower_with_declarations,
 };
 use boltffi_scan::{ActiveCfg, ScanError, ScanInput};
 use proc_macro2::{Span, TokenStream};
@@ -70,6 +70,13 @@ struct BuildContext {
     support: SourceContract,
     visible_paths: Vec<(String, boltffi_ast::Path)>,
     data_source_files: HashMap<String, SourceFile>,
+    /// `support`, lowered. Every `#[data]` that resolves against the crate-wide
+    /// contract lowers the same declarations to the same bindings — the
+    /// contract and the surface are both fixed once `load` returns — so the
+    /// work is done on the first one and borrowed by the rest. Only the surface
+    /// `request.surface` names is ever populated. See `memoised`.
+    support_native: OnceLock<Result<LoweredBindings<Native>, String>>,
+    support_wasm32: OnceLock<Result<LoweredBindings<Wasm32>, String>>,
 }
 
 #[derive(Deserialize)]
@@ -164,6 +171,8 @@ impl BuildContext {
             support,
             visible_paths,
             data_source_files,
+            support_native: OnceLock::new(),
+            support_wasm32: OnceLock::new(),
         })
     }
 
@@ -214,7 +223,7 @@ impl BuildContext {
             return self.render_data_id(&contract, id);
         }
         if let Some(id) = declaration.resolve(&self.support, |id| self.data_source_files.get(id)) {
-            return self.render_data_id(&self.support, id);
+            return self.render_support_data_id(id);
         }
         let contract =
             boltffi_scan::scan_source(declaration.source(), self.request.package.clone())?;
@@ -262,6 +271,51 @@ impl BuildContext {
                     .map_err(Into::into)
             }
         }
+    }
+
+    /// `render_data_id` against the crate-wide contract, off the lowering memo.
+    ///
+    /// This is the path every `#[data]` in an ordinary crate takes, so the
+    /// lowering it repeats is the dominant cost of expanding one: a crate of
+    /// ~850 mirrored types lowered all ~850 of them that many times over.
+    /// `ExpansionIndex` is rebuilt per call and stays that way — it is one map
+    /// over the lowered declarations, and cheap beside the lowering itself.
+    fn render_support_data_id(&self, id: DataId) -> Result<TokenStream, BuildError> {
+        let expander = Expander::with_support(&self.support, &self.support, std::iter::empty());
+        match self.request.surface {
+            BindingMetadataSurface::Native => {
+                let lowered = Self::memoised(&self.support_native, &self.support)?;
+                let expansion = Expansion::new(lowered);
+                match id {
+                    DataId::Record(id) => expander.record_runtime(&id, &expansion),
+                    DataId::Enumeration(id) => expander.enumeration_runtime(&id, &expansion),
+                }
+                .map_err(Into::into)
+            }
+            BindingMetadataSurface::Wasm32 => {
+                let lowered = Self::memoised(&self.support_wasm32, &self.support)?;
+                let expansion = Expansion::new(lowered);
+                match id {
+                    DataId::Record(id) => expander.record_runtime(&id, &expansion),
+                    DataId::Enumeration(id) => expander.enumeration_runtime(&id, &expansion),
+                }
+                .map_err(Into::into)
+            }
+        }
+    }
+
+    /// Lowers `source` into `slot` once, and hands back what is in it.
+    ///
+    /// A failure is cached as its message, the way `context` caches a failed
+    /// load: the error is reported once per expansion either way, so every
+    /// `#[data]` still carries it.
+    fn memoised<'slot, S: SurfaceLower>(
+        slot: &'slot OnceLock<Result<LoweredBindings<S>, String>>,
+        source: &SourceContract,
+    ) -> Result<&'slot LoweredBindings<S>, BuildError> {
+        slot.get_or_init(|| lower_with_declarations::<S>(source).map_err(|error| error.to_string()))
+            .as_ref()
+            .map_err(|message| BuildError::Cached(message.clone()))
     }
 
     fn render_data_id(
