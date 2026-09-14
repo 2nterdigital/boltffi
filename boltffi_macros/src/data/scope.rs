@@ -60,7 +60,8 @@ struct FileIndex {
 }
 
 thread_local! {
-    /// Files already indexed, by path.
+    /// Files already indexed, by path, each holding the text it was built
+    /// from so `file_index` can tell whether it still describes the file.
     ///
     /// `#[data]` expands once per mirrored type, and every expansion in a file
     /// wants the same scope information out of it, so a file is parsed on the
@@ -72,19 +73,30 @@ thread_local! {
         RefCell::new(HashMap::new());
 }
 
-/// `path`, read and indexed, from the cache when it is already there.
+/// `path`, read and indexed, reusing the cached index while the file is
+/// unchanged.
+///
+/// The text is read on every call and compared, because a macro host can
+/// outlive the compilation that filled this cache: rust-analyzer keeps the
+/// expander loaded across edits, and an index matched on path alone would
+/// answer a post-edit expansion with pre-edit text and scopes — a declaration
+/// resolved into the module it used to be in, or an unlocatable one. Reading is
+/// what every invocation did before there was a cache; the parse is what it
+/// saves.
 ///
 /// A failure is not cached: it is reported once per declaration either way.
 fn file_index(path: &Path) -> syn::Result<Rc<FileIndex>> {
-    if let Some(cached) = FILE_INDEXES.with(|files| files.borrow().get(path).cloned()) {
-        return Ok(cached);
-    }
     let text = fs::read_to_string(path).map_err(|error| {
         syn::Error::new(
             proc_macro2::Span::call_site(),
             format!("read data source `{}`: {error}", path.display()),
         )
     })?;
+    if let Some(cached) = FILE_INDEXES.with(|files| files.borrow().get(path).cloned())
+        && cached.text == text
+    {
+        return Ok(cached);
+    }
     // The parse is dropped at the end of this scope, inside the invocation that
     // made it. Only `scopes`, which owns its strings, outlives it.
     let scopes = ScopeIndexer::index(&syn::parse_file(&text)?);
