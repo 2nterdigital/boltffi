@@ -149,6 +149,9 @@ internal class WireReader(private val bytes: ByteArray) {
     private var position = 0
 
     fun skip(count: Int): WireReader {
+        if (count > bytes.size - position) {
+            throw IndexOutOfBoundsException("Wire read past the end of the payload")
+        }
         position += count
         return this
     }

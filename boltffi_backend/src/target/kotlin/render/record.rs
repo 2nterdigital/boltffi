@@ -266,7 +266,11 @@ impl Record {
             body: RecordBody::Direct {
                 size,
                 wire_size: record.is_codec_payload().then(|| Expression::integer(size)),
-                trailing_padding: size - end,
+                trailing_padding: size.checked_sub(end).ok_or(
+                    KotlinHost::broken_bridge_contract(
+                        "direct record size is smaller than its fields",
+                    ),
+                )?,
             },
             error: record.is_error_payload(),
             constants: AssociatedConstants::from_owner(
