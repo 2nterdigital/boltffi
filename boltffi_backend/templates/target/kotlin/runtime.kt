@@ -139,6 +139,11 @@ private object DirectVectorCodec {
 internal class WireReader(private val bytes: ByteArray) {
     private var position = 0
 
+    fun skip(count: Int): WireReader {
+        position += count
+        return this
+    }
+
     fun readBool(): Boolean = readI8() != 0.toByte()
 
     fun readI8(): Byte {
@@ -463,6 +468,11 @@ internal class WireWriter(initialCapacity: Int) {
     fun writeBytes(value: ByteArray) {
         writeU32(value.size.toUInt())
         writeBytesRaw(value)
+    }
+
+    fun pad(count: Int): WireWriter {
+        repeat(count) { writeI8(0) }
+        return this
     }
 
     fun writeBooleanArray(values: BooleanArray) {

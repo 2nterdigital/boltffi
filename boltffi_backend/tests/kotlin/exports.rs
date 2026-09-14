@@ -98,8 +98,10 @@ fn kotlin_target_renders_encoded_records_through_codec_methods() {
 fn kotlin_target_encodes_direct_records_nested_in_wire_values() {
     let rendered = rendered_fixture("records/encoded_with_direct_record");
 
-    assert!(rendered.contains("internal fun wireSize(): Int {\n        return 9"));
+    assert!(rendered.contains("internal fun wireSize(): Int {\n        return 12"));
     assert!(rendered.contains("writer.writeI32(x)"));
+    assert!(rendered.contains("writer.writeBool(active)\n        writer.pad(3)"));
+    assert!(rendered.contains("reader.readBool()\n            ).also { reader.skip(3) }"));
     assert!(rendered.contains("reader.readI32()"));
     assert!(rendered.contains("buffer.`get`(offset + 8)"));
     assert!(rendered.contains("start.writeTo(writer)"));
