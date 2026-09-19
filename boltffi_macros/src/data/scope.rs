@@ -1,11 +1,14 @@
+use std::cell::RefCell;
+use std::collections::HashMap;
 use std::fs;
 use std::path::{Path, PathBuf};
+use std::rc::Rc;
 
 use boltffi_ast::{EnumId, RecordId, SourceContract, SourceFile, SourceSpan};
 use proc_macro2::LineColumn;
 use syn::visit::Visit;
 
-#[derive(Clone, Copy, Eq, PartialEq)]
+#[derive(Clone, Copy, Eq, Hash, PartialEq)]
 pub enum DeclarationKind {
     Record,
     Enumeration,
@@ -39,6 +42,152 @@ struct ScopeFinder<'target> {
     scope: Option<Scope>,
 }
 
+/// Where each declaration in one source file sits, without anything the
+/// proc-macro bridge owns.
+///
+/// A `syn::File` cannot outlive the `#[data]` invocation that parsed it: its
+/// `Ident`s borrow symbols the bridge frees when the invocation ends, so
+/// keeping one is a use-after-free, not merely a lifetime inconvenience. What
+/// survives is what `from_macro_input` actually needs out of the parse — the
+/// text, and every declaration's module path as plain `String`s.
+struct FileIndex {
+    text: String,
+    /// `(name, kind)` -> the scope of each declaration of that name, in visit
+    /// order, so a lookup by ordinal answers what `ScopeFinder` would. `None`
+    /// marks one declared inside a block: its items are token-backed, so that
+    /// case re-parses instead.
+    scopes: HashMap<(String, DeclarationKind), Vec<Option<Vec<String>>>>,
+}
+
+thread_local! {
+    /// Files already indexed, by path, each holding the text it was built
+    /// from so `file_index` can tell whether it still describes the file.
+    ///
+    /// `#[data]` expands once per mirrored type, and every expansion in a file
+    /// wants the same scope information out of it, so a file is parsed on the
+    /// first one and answered from here for the rest.
+    ///
+    /// Thread-local because it is written from the macro's own thread and needs
+    /// no sharing; the entries themselves own their data outright.
+    static FILE_INDEXES: RefCell<HashMap<PathBuf, Rc<FileIndex>>> =
+        RefCell::new(HashMap::new());
+}
+
+/// `path`, read and indexed, reusing the cached index while the file is
+/// unchanged.
+///
+/// The text is read on every call and compared, because a macro host can
+/// outlive the compilation that filled this cache: rust-analyzer keeps the
+/// expander loaded across edits, and an index matched on path alone would
+/// answer a post-edit expansion with pre-edit text and scopes — a declaration
+/// resolved into the module it used to be in, or an unlocatable one. Reading is
+/// what every invocation did before there was a cache; the parse is what it
+/// saves.
+///
+/// A failure is not cached: it is reported once per declaration either way.
+fn file_index(path: &Path) -> syn::Result<Rc<FileIndex>> {
+    let text = fs::read_to_string(path).map_err(|error| {
+        syn::Error::new(
+            proc_macro2::Span::call_site(),
+            format!("read data source `{}`: {error}", path.display()),
+        )
+    })?;
+    if let Some(cached) = FILE_INDEXES.with(|files| files.borrow().get(path).cloned())
+        && cached.text == text
+    {
+        return Ok(cached);
+    }
+    // The parse is dropped at the end of this scope, inside the invocation that
+    // made it. Only `scopes`, which owns its strings, outlives it.
+    let scopes = ScopeIndexer::index(&syn::parse_file(&text)?);
+    let index = Rc::new(FileIndex { text, scopes });
+    FILE_INDEXES.with(|files| {
+        files
+            .borrow_mut()
+            .insert(path.to_path_buf(), Rc::clone(&index))
+    });
+    Ok(index)
+}
+
+/// The scope an indexed declaration is in. `ScopeFinder`'s `Scope`, minus the
+/// block's items, which is exactly the part that cannot be cached.
+#[derive(Clone)]
+enum IndexScope {
+    Module(Vec<String>),
+    Block,
+}
+
+/// Records every declaration's scope in one walk, counting names the way
+/// `ScopeFinder` counts the one it is looking for.
+struct ScopeIndexer {
+    current: IndexScope,
+    scopes: HashMap<(String, DeclarationKind), Vec<Option<Vec<String>>>>,
+}
+
+impl ScopeIndexer {
+    fn index(syntax: &syn::File) -> HashMap<(String, DeclarationKind), Vec<Option<Vec<String>>>> {
+        let mut indexer = Self {
+            current: IndexScope::Module(Vec::new()),
+            scopes: HashMap::new(),
+        };
+        indexer.visit_file(syntax);
+        indexer.scopes
+    }
+
+    fn observe(&mut self, kind: DeclarationKind, name: &syn::Ident) {
+        let scope = match &self.current {
+            IndexScope::Module(path) => Some(path.clone()),
+            IndexScope::Block => None,
+        };
+        self.scopes
+            .entry((name.to_string(), kind))
+            .or_default()
+            .push(scope);
+    }
+}
+
+impl<'syntax> Visit<'syntax> for ScopeIndexer {
+    fn visit_file(&mut self, syntax: &'syntax syn::File) {
+        self.current = IndexScope::Module(Vec::new());
+        syntax.items.iter().for_each(|item| self.visit_item(item));
+    }
+
+    fn visit_item_mod(&mut self, module: &'syntax syn::ItemMod) {
+        let Some((_, items)) = &module.content else {
+            return;
+        };
+        let nested = match &self.current {
+            IndexScope::Module(path) => IndexScope::Module(
+                path.iter()
+                    .cloned()
+                    .chain(std::iter::once(module.ident.to_string()))
+                    .collect(),
+            ),
+            IndexScope::Block => IndexScope::Block,
+        };
+        let enclosing = std::mem::replace(&mut self.current, nested);
+        items.iter().for_each(|item| self.visit_item(item));
+        self.current = enclosing;
+    }
+
+    fn visit_block(&mut self, block: &'syntax syn::Block) {
+        let enclosing = std::mem::replace(&mut self.current, IndexScope::Block);
+        block
+            .stmts
+            .iter()
+            .for_each(|statement| self.visit_stmt(statement));
+        self.current = enclosing;
+    }
+
+    fn visit_item_struct(&mut self, item: &'syntax syn::ItemStruct) {
+        self.observe(DeclarationKind::Record, &item.ident);
+    }
+
+    fn visit_item_enum(&mut self, item: &'syntax syn::ItemEnum) {
+        self.observe(DeclarationKind::Enumeration, &item.ident);
+    }
+}
+
 impl Declaration {
     pub fn from_macro_input(item: &proc_macro::TokenStream) -> syn::Result<Self> {
         let parsed = syn::parse::<syn::Item>(item.clone())?;
@@ -70,13 +219,7 @@ impl Declaration {
             line: invocation.line(),
             column: invocation.column(),
         };
-        let source_text = fs::read_to_string(&source).map_err(|error| {
-            syn::Error::new(
-                proc_macro2::Span::call_site(),
-                format!("read data source `{}`: {error}", source.display()),
-            )
-        })?;
-        let invocation_offset = Self::source_offset(&source_text, location).ok_or_else(|| {
+        let unlocatable = || {
             syn::Error::new(
                 proc_macro2::Span::call_site(),
                 format!(
@@ -86,43 +229,38 @@ impl Declaration {
                     source.display()
                 ),
             )
-        })?;
-        let target_ordinal =
-            Self::declaration_ordinal(&source_text, &name, kind, invocation_offset).ok_or_else(
-                || {
-                    syn::Error::new(
-                        proc_macro2::Span::call_site(),
-                        format!(
-                            "locate data declaration `{name}` at {}:{} in `{}`",
-                            location.line,
-                            location.column,
-                            source.display()
-                        ),
-                    )
-                },
-            )?;
-        let syntax = syn::parse_file(&source_text)?;
-        let scope = ScopeFinder::find(&syntax, &name, kind, target_ordinal).ok_or_else(|| {
-            syn::Error::new(
-                proc_macro2::Span::call_site(),
-                format!(
-                    "locate data declaration `{name}` at {}:{} in `{}`",
-                    location.line,
-                    location.column,
-                    source.display()
-                ),
-            )
-        })?;
-        let (module_path, local_scope) = match scope {
-            Scope::Module(module_path) => (module_path, None),
-            Scope::Block(items) => (
-                Vec::new(),
-                Some(syn::File {
-                    shebang: None,
-                    attrs: Vec::new(),
-                    items,
-                }),
-            ),
+        };
+        let index = file_index(&source)?;
+        let invocation_offset =
+            Self::source_offset(&index.text, location).ok_or_else(unlocatable)?;
+        let target_ordinal = Self::declaration_ordinal(&index.text, &name, kind, invocation_offset)
+            .ok_or_else(unlocatable)?;
+        let indexed = index
+            .scopes
+            .get(&(name.clone(), kind))
+            .and_then(|scopes| scopes.get(target_ordinal));
+        let (module_path, local_scope) = match indexed {
+            Some(Some(module_path)) => (module_path.clone(), None),
+            // Block-scoped, or not in the index at all: the items a block scope
+            // carries are token-backed and cannot outlive this invocation, so
+            // that one file is parsed again here. `ScopeFinder` also owns the
+            // not-found case, which keeps the error identical either way.
+            Some(None) | None => {
+                let syntax = syn::parse_file(&index.text)?;
+                match ScopeFinder::find(&syntax, &name, kind, target_ordinal)
+                    .ok_or_else(unlocatable)?
+                {
+                    Scope::Module(module_path) => (module_path, None),
+                    Scope::Block(items) => (
+                        Vec::new(),
+                        Some(syn::File {
+                            shebang: None,
+                            attrs: Vec::new(),
+                            items,
+                        }),
+                    ),
+                }
+            }
         };
         Ok(Self {
             name,
