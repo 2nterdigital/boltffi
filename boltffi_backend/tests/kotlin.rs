@@ -12,6 +12,8 @@ mod constant;
 mod direct_vector;
 #[path = "kotlin/exports.rs"]
 mod exports;
+#[path = "kotlin/record.rs"]
+mod record;
 #[path = "kotlin/stream.rs"]
 mod stream;
 

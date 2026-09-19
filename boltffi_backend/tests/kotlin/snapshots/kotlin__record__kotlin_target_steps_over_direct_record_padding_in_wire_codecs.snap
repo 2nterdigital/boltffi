@@ -1,0 +1,141 @@
+---
+source: boltffi_backend/tests/kotlin/record.rs
+expression: rendered
+---
+===== com/boltffi/demo/Demo.kt =====
+@file:OptIn(kotlin.ExperimentalUnsignedTypes::class)
+
+package com.boltffi.demo
+@Suppress("FunctionName")
+private object Native {
+    @JvmStatic external fun boltffi_function_demo_items(): ByteArray?
+}
+
+
+data class Padded(
+    val tag: UShort,
+    val value: Int,
+    val flag: UByte
+) {
+    internal fun wireSize(): Int {
+        return 12
+    }
+
+    internal fun writeTo(writer: WireWriter) {
+        writer.writeU16(tag)
+        writer.pad(2).writeI32(value)
+        writer.writeU8(flag)
+        writer.pad(3)
+    }
+    internal fun toByteArray(): ByteArray {
+        val buffer = java.nio.ByteBuffer
+            .allocate(STRUCT_SIZE)
+            .order(java.nio.ByteOrder.nativeOrder())
+        writeTo(buffer, 0)
+        return buffer.array()
+    }
+
+    internal fun toDirectBuffer(): java.nio.ByteBuffer {
+        val buffer = java.nio.ByteBuffer
+            .allocateDirect(STRUCT_SIZE)
+            .order(java.nio.ByteOrder.nativeOrder())
+        writeTo(buffer, 0)
+        return buffer
+    }
+
+    internal fun writeTo(buffer: java.nio.ByteBuffer, offset: Int) {
+        buffer.putShort(offset, tag.toShort())
+        buffer.putInt(offset + 4, value)
+        buffer.put(offset + 8, flag.toByte())
+    }
+
+    companion object {
+        internal const val STRUCT_SIZE: Int = 12
+        internal fun fromReader(reader: WireReader): Padded {
+            return Padded(
+                reader.readU16(),
+                reader.skip(2).readI32(),
+                reader.readU8()
+            ).also { reader.skip(3) }
+        }
+
+        internal fun fromByteArray(bytes: ByteArray): Padded {
+            require(bytes.size == STRUCT_SIZE)
+            val buffer = java.nio.ByteBuffer
+                .wrap(bytes)
+                .order(java.nio.ByteOrder.nativeOrder())
+            return fromBuffer(buffer, 0)
+        }
+
+        internal fun fromBuffer(buffer: java.nio.ByteBuffer, offset: Int): Padded {
+            return Padded(
+                buffer.getShort(offset).toUShort(),
+                buffer.getInt(offset + 4),
+                buffer.`get`(offset + 8).toUByte()
+            )
+        }
+    }
+}
+
+
+sealed class Item {
+    internal abstract fun wireSize(): Int
+
+    internal abstract fun writeTo(writer: WireWriter)
+
+    internal fun toByteArray(): ByteArray {
+        val buffer = WireWriterPool.acquire(wireSize())
+        val writer = buffer.writer
+        try {
+            writeTo(writer)
+            return buffer.bytes()
+        } finally {
+            buffer.close()
+        }
+    }
+
+
+    data class Padded(
+        val field0: com.boltffi.demo.Padded
+    ) : Item() {
+        internal override fun wireSize(): Int {
+            return 4 + this.field0.wireSize()
+        }
+
+        internal override fun writeTo(writer: WireWriter) {
+            writer.writeU32(0.toUInt())
+            this.field0.writeTo(writer)
+        }
+    }
+    object Empty : Item() {
+        internal override fun wireSize(): Int {
+            return 4
+        }
+
+        internal override fun writeTo(writer: WireWriter) {
+            writer.writeU32(1.toUInt())
+        }
+    }
+
+    companion object {
+        internal fun fromReader(reader: WireReader): Item {
+            val tag = reader.readU32()
+            return when (tag) {
+                0.toUInt() -> Padded(com.boltffi.demo.Padded.fromReader(reader))
+                1.toUInt() -> Empty
+                else -> throw IllegalArgumentException("unknown Item tag: $tag")
+            }
+        }
+
+        internal fun fromByteArray(bytes: ByteArray): Item {
+            val reader = WireReader(bytes)
+            return fromReader(reader)
+        }
+    }
+}
+
+fun items(): List<Item> {
+    val __boltffi_result = Native.boltffi_function_demo_items() ?: throw IllegalStateException("null buffer returned")
+    val __boltffi_reader = WireReader(__boltffi_result)
+    return __boltffi_reader.readSequence({ __boltffi_reader -> Item.fromReader(__boltffi_reader) })
+}

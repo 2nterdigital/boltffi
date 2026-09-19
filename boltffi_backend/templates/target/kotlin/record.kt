@@ -276,6 +276,9 @@
 {%- for field in record.fields() %}
         {{ field.write() }}
 {%- endfor %}
+{%- if let Some(padding) = record.trailing_padding() %}
+        writer.pad({{ padding }})
+{%- endif %}
     }
 {%- endif %}
     internal fun toByteArray(): ByteArray {
@@ -309,7 +312,7 @@
 {%- for field in record.fields() %}
                 {{ field.read() }}{% if !loop.last %},{% endif %}
 {%- endfor %}
-            )
+            ){% if let Some(padding) = record.trailing_padding() %}.also { reader.skip({{ padding }}) }{% endif %}
         }
 {%- endif %}
 
