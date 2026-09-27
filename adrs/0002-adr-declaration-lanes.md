@@ -77,8 +77,9 @@ where the two disagree.
 
 - **One decider.** The wrapper and the bindings consume one classified contract, produced
   by the same code.
-- **ABI kept.** Today's C signatures on every target: direct records by value, encoded
-  values as pointer and length, spans, split `Result` channels.
+- **Signatures kept.** Today's parameter and return representations on every target:
+  direct records by value, encoded values as pointer and length, spans, split `Result`
+  channels. Symbol names change (D3), so existing bindings are regenerated.
 - **No scan.** Nothing reads source files, so everything rustc compiles is seen, and
   nothing else is.
 - **One build.** Plain `cargo build` produces the wrappers, and `generate` needs no
@@ -86,7 +87,7 @@ where the two disagree.
 
 ## 3. Considered Alternatives
 
-| | Approach | One decider | ABI kept | No scan | Why not |
+| | Approach | One decider | Signatures kept | No scan | Why not |
 |---|---|---|---|---|---|
 | A | Whole-crate scan (`main`) | yes | yes | no | The limitations in §1.2 |
 | B | Discovery only: records for bindgen, scan for wrappers | guarded | yes | no | Two pipelines kept equal by hand, with no user gain |
@@ -108,7 +109,7 @@ over its own fragment and theirs. It lowers and renders only its own item; the n
 types only answer what they are and how they are laid out.
 
 ```rust
-// emitted by #[data] Point
+// emitted by #[data] Point, in crate geo
 #[macro_export]
 macro_rules! __boltffi_lane_geo_Point_0 {
     ([$($callback:tt)*] { $($state:tt)* }) => {
@@ -117,6 +118,21 @@ macro_rules! __boltffi_lane_geo_Point_0 {
 }
 pub use __boltffi_lane_geo_Point_0 as Point;
 ```
+
+The string is the fragment `#[data]` parsed from `Point`. Without docs, defaults, attributes
+and canonical names:
+
+```json
+{ "id": "geo::Point",
+  "entries": [{ "json": { "record": {
+    "id": "$self::Point",
+    "fields": [ { "name": "x", "type_expr": { "Primitive": "F64" } },
+                { "name": "y", "type_expr": { "Primitive": "F64" } } ],
+    "repr": { "items": [] } } } }] }
+```
+
+Of a named type, lowering reads only its fields, `repr` and variants, the same fragment the
+scan produced on `main`, so it classifies the type as `main` does.
 
 Macros and types live in separate namespaces, so any path that names `Point` also names
 its lane, through imports, renames, globs, re-exports and other crates. The compiler does
@@ -128,6 +144,9 @@ the envelope path is deleted.
 ### 4.1 Worked example
 
 ```rust
+// src/lib.rs of crate geo
+boltffi::scaffolding!();
+
 pub mod shapes {
     #[data] pub struct Point { pub x: f64, pub y: f64 }
     #[data] pub struct Line { pub a: Point, pub b: Point }
@@ -140,10 +159,20 @@ use shapes::Line;
 
 Each macro describes its own item as a source fragment. The fragment leaves a hole,
 `$slot:0`, wherever the item names another type, because the macro sees only the word
-`Point`.
+`Point`. `Line`'s lane carries:
 
-Every declared type defines its lane at once, from its own fragment, so `Line`'s lane
-exists before anything resolves `Point`. Then `#[data] Line` expands in three steps:
+```json
+{ "id": "geo::Line",
+  "entries": [{ "json": { "record": {
+    "id": "$self::Line",
+    "fields": [ { "name": "a", "type_expr": { "Record": { "id": "$slot:0", "path": "Point" } } },
+                { "name": "b", "type_expr": { "Record": { "id": "$slot:0", "path": "Point" } } } ],
+    "repr": { "items": [] } } } }] }
+```
+
+Every declared type except a custom type (below) defines its lane at once, from its own
+fragment, so `Line`'s lane exists before anything resolves `Point`. Then `#[data] Line`
+expands in three steps:
 
 ```rust
 // 1. The attribute emits the struct and its lane, and calls Point's lane.
@@ -176,6 +205,10 @@ of the types it names, and classes and callbacks only by id. Since no lane waits
 another, types may refer to each other: `Folder { files: Vec<File> }` beside
 `File { subfolders: Vec<Folder> }` builds, and so do recursive records.
 
+`custom_type!` is the exception. A custom type crosses as its representation, so its own
+fragment is incomplete until the representation's lane answers, and its lane is defined
+only then.
+
 ### 4.2 Decisions within the design
 
 | | Decision | Reason |
@@ -183,11 +216,11 @@ another, types may refer to each other: `Folder { files: Vec<File> }` beside
 | D1 | Lanes carry fragments, not a classification keyword | The invocation runs bindgen's own lowering, so there is exactly one classifier |
 | D2 | Lower per invocation, not pre-lowered summaries | Summaries are a second representation to keep in sync. Revisit if compile time bites a real crate |
 | D3 | Ids are crate and name; symbols drop the module (`boltffi_function_demo_add_i32`) | A proc macro cannot know its module path. The foreign namespace is flat by name, so same-named types or exports in one crate fail to build |
-| D4 | `cfg` is evaluated through a derive probe | The only exact option, and there is no scan left to fall back to |
+| D4 | `cfg` is evaluated through a derive probe | The only exact option, and there is no scan left to fall back to. It covers items and their fields, variants and members; `cfg` on a parameter is refused with a message to gate the function instead, and fails on `main` too |
 | D5 | `custom_type!` types are written by their declared name, which aliases the remote type | A signature naming `DateTime<Utc>` has no lane, and stable Rust cannot test whether a macro exists |
 | D6 | Types named `Duration`, `SystemTime`, `Uuid` or `Url` are rejected at the declaration | Signatures spelling those names cross as the builtin |
 | D7 | Capture is always on; bindgen reads records only | A fallback is a second pipeline to keep equivalent |
-| D8 | A class's `#[export] impl` sits in the struct's module | The class lane is defined beside the impl and must resolve wherever the struct does |
+| D8 | A class's `#[export] impl` sits in the struct's module, and names the class | The class lane is defined beside the impl and must resolve wherever the struct does. The impl is all the macro sees, so `impl Motor` for a renamed `struct Engine` binds `Motor` |
 | D9 | Lanes carry one level: the type's own fragment, with its references unresolved | Lowering never reads past a named type's own shape, so this is exact, lets types refer to each other, and keeps each use linear |
 | D10 | Bindings cover the root crate and its path dependencies in full; registry and git crates only where they are reached | Matches what `main` binds, and extends it to registry types a signature uses. Two crates binding the same name are refused |
 | D11 | `generate` checks every symbol the bindings call against the built library | A dependency's wrappers live in that crate, so a crate the library never uses is not linked. The error lists the symbols and names the fix, `use <crate> as _;` |
@@ -202,7 +235,7 @@ walks one crate through every expansion there.
 
 - Every annotation expands per invocation. The macros read no source files, and bindgen
   reads records only.
-- The workspace tests pass (2,645), including fixtures for mutually referring types
+- The workspace tests pass (2,700), including fixtures for mutually referring types
   and for linked, unlinked and colliding dependencies.
 - The demo suite passes on Python, Swift, Kotlin, Java, C#, wasm and Dart, and CI passes on
   Linux, macOS and Windows, including Android and C# packaging.
@@ -224,18 +257,22 @@ walks one crate through every expansion there.
 
 ### Negative and costs
 
-- **Breaking.** Symbols drop module segments (D3), `custom_type!` spelling changes (D5),
-  class impls sit in the struct's module (D8), and builtin names are refused (D6). A
-  `macro_rules!` named like a declared type collides with its lane.
-- **Compile time.** Against `main`, the demo builds 22% slower clean in debug, 15% faster
-  in release, and 19% slower after an edit. Synthetic crates of 400 flat records or a
-  200-deep record chain build 50% slower. Pre-lowered summaries (D2) are the next lever.
+- **Breaking.** Every crate adds `boltffi::scaffolding!()` at its root. Symbols drop module
+  segments (D3), `custom_type!` spelling changes (D5), class impls sit in the struct's
+  module and name the class (D8), and builtin names are refused (D6). A `macro_rules!`
+  named like a declared type collides with its lane.
+- **Compile time.** Against `main`, the demo builds 28% slower clean in debug, 9% faster
+  in release, and 26% slower after an edit. Synthetic crates of 400 flat records or a
+  200-deep record chain build 55% and 51% slower. Pre-lowered summaries (D2) are the next
+  lever. Measured with [`0002-bench.py`](0002-bench.py), median of 5 runs, on `main` at
+  `196a06b9` and the branch at `d1426da7`, on an Apple M4 Pro with rustc 1.95.0.
 - **Dependencies.** A path dependency the library never uses is not linked, so `generate`
   fails until the root names it (D11). `custom_type!` in a dependency does not compile
   yet: its conversions are keyed to the declaring crate's tag. It fails on `main` too.
-- **Binary size.** Records grow the demo's dylib from 1.74 to 2.23 MB. Nothing reads
-  them at runtime, so `boltffi pack` can drop them.
-- **Diagnostics.** Misuse surfaces as `cannot find macro` and needs friendlier errors.
+- **Binary size.** Records grow the demo's release dylib from 1.82 to 2.43 MB. Nothing reads
+  them at runtime; stripping them in `boltffi pack` is follow-up work.
+- **Diagnostics.** Misuse surfaces as `cannot find macro`, and a missing
+  `scaffolding!()` as ``cannot find type `__BoltffiTag` ``; both need friendlier errors.
 
 ### Not yet verified
 
