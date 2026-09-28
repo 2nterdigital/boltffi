@@ -531,3 +531,13 @@ fn kotlin_target_uses_configured_c_header_in_jni_bridge() {
 
     insta::assert_snapshot!(rendered_files(&files));
 }
+
+#[test]
+fn kotlin_target_keeps_a_long_initializer_off_the_handle_constructor_signature() {
+    let rendered = rendered_fixture("exports/long_initializer");
+
+    // `constructor(balance: Long)` would clash with `internal constructor(handle: Long)`
+    assert!(rendered.contains("class Ledger internal constructor(internal val handle: Long)"));
+    assert!(!rendered.contains("constructor(balance: Long)"));
+    assert!(rendered.contains("fun new(balance: Long): Ledger"));
+}

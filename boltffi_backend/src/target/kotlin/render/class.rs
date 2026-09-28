@@ -238,8 +238,12 @@ impl Initializer {
     }
 
     fn dedupe_constructors(initializers: Vec<Self>) -> Vec<Self> {
+        // The class's own `internal constructor(handle: Long)` takes the
+        // `(Long)` signature: an initializer with that shape stays a
+        // companion factory rather than a clashing overload.
+        let reserved = BTreeSet::from([ConstructorSignature::handle()]);
         let (_, initializers) = initializers.into_iter().fold(
-            (BTreeSet::new(), Vec::new()),
+            (reserved, Vec::new()),
             |(mut signatures, mut initializers), mut initializer| {
                 if initializer.constructor {
                     initializer.constructor =
@@ -259,6 +263,10 @@ impl Initializer {
 }
 
 impl ConstructorSignature {
+    fn handle() -> Self {
+        Self(vec![TypeName::long().to_string()])
+    }
+
     fn from_call(call: &ExportedCall) -> Self {
         Self(
             call.parameters()
