@@ -592,6 +592,7 @@ private let rustToSwiftCoverageFile: [String: String] = [
     "multicrate/mod.rs": "multicrate/MultiCrateTests.swift",
     "options/complex.rs": "options/ComplexOptionsTests.swift",
     "options/primitives.rs": "options/PrimitivesOptionsTests.swift",
+    "primitives/default_arguments.rs": "primitives/DefaultArgumentsTests.swift",
     "primitives/scalars.rs": "primitives/ScalarsTests.swift",
     "primitives/strings.rs": "primitives/StringsTests.swift",
     "primitives/vecs.rs": "primitives/VecsTests.swift",
