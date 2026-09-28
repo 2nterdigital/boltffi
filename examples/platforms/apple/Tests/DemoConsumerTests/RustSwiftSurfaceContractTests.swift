@@ -330,7 +330,10 @@ final class RustSwiftSurfaceContractTests: DemoTestCase {
             return nil
         }
 
+        // a parameter attribute such as `#[boltffi::default(10)]` is not a
+        // label, and its `::` would otherwise match as one
         return parameterList
+            .replacingOccurrences(of: #"#\[[^\]]*\]"#, with: "", options: .regularExpression)
             .captures(pattern: #"([A-Za-z0-9_]+)\s*:"#)
             .compactMap { $0.first }
             .first(where: { $0 != "self" })
