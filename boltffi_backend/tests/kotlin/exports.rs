@@ -533,6 +533,24 @@ fn kotlin_target_uses_configured_c_header_in_jni_bridge() {
 }
 
 #[test]
+fn kotlin_target_renders_parameter_defaults_as_default_arguments() {
+    let rendered = rendered_fixture("exports/parameter_defaults");
+
+    assert!(rendered.contains("fun greet(name: String, greeting: String = \"world\", times: UInt = 3.toUInt(), offset: Long = -1, shout: Boolean = true, ratio: Float = 0.5f, mode: Mode = Mode.SLOW, suffix: String? = null, limit: UShort? = 7.toUShort()): String"));
+    // constructors, companion factories and methods take them the same way
+    assert!(rendered.contains("constructor(port: UShort = 8080.toUShort())"));
+    assert!(rendered.contains("fun new(port: UShort = 8080.toUShort()): Server"));
+    assert!(rendered.contains(
+        "suspend fun start(port: UShort, first: Handler? = null, second: Handler? = null)"
+    ));
+    assert!(rendered.contains("fun port(mapped: Boolean = false)"));
+    // what crosses the native boundary is unchanged: defaults are Kotlin-only
+    assert!(!rendered.contains("external fun boltffi_greet(name: String, greeting: String ="));
+
+    insta::assert_snapshot!(rendered);
+}
+
+#[test]
 fn kotlin_target_keeps_a_long_initializer_off_the_handle_constructor_signature() {
     let rendered = rendered_fixture("exports/long_initializer");
 

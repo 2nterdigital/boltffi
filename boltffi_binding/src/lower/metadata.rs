@@ -85,6 +85,11 @@ fn lower_default(
         (_, SourceDefaultValue::Path(_)) => {
             Err(LowerError::unsupported_type(UnsupportedType::DefaultValue))
         }
+        // `None` is only a value of an `Option`: on anything else no host
+        // could spell it, so reject it here instead of in every backend.
+        (type_expr, SourceDefaultValue::None) if !matches!(type_expr, TypeExpr::Option(_)) => {
+            Err(LowerError::unsupported_type(UnsupportedType::DefaultValue))
+        }
         (_, default) => DefaultValue::try_from(default),
     }
 }
