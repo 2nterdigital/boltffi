@@ -22,7 +22,10 @@ pub enum DataId {
 pub struct Declaration {
     name: String,
     kind: DeclarationKind,
-    source: PathBuf,
+    /// `None` when the macro host cannot name the invoking file:
+    /// rust-analyzer's expander answers `Span::local_file` with nothing. Such a
+    /// declaration is known by its name alone; see `resolve`.
+    source: Option<PathBuf>,
     module_path: Vec<String>,
     local_scope: Option<syn::File>,
 }
@@ -304,12 +307,9 @@ impl Declaration {
                 ));
             }
         };
-        let source = invocation.local_file().ok_or_else(|| {
-            syn::Error::new(
-                proc_macro2::Span::call_site(),
-                "data source file is unavailable",
-            )
-        })?;
+        let Some(source) = invocation.local_file() else {
+            return Ok(Self::unlocated(name, kind));
+        };
         let location = LineColumn {
             line: invocation.line(),
             column: invocation.column(),
@@ -360,54 +360,80 @@ impl Declaration {
         Ok(Self {
             name,
             kind,
-            source,
+            source: Some(source),
             module_path,
             local_scope,
         })
+    }
+
+    /// A declaration whose file the macro host could not name.
+    fn unlocated(name: String, kind: DeclarationKind) -> Self {
+        Self {
+            name,
+            kind,
+            source: None,
+            module_path: Vec::new(),
+            local_scope: None,
+        }
     }
 
     pub fn name(&self) -> &str {
         &self.name
     }
 
-    pub fn source(&self) -> &Path {
-        &self.source
+    pub fn source(&self) -> Option<&Path> {
+        self.source.as_deref()
     }
 
     pub fn local_scope(&self) -> Option<&syn::File> {
         self.local_scope.as_ref()
     }
 
+    /// The contract declaration this one is.
+    ///
+    /// Without a source file only the name is left to match on, so the answer
+    /// is given only when the name is unique among the contract's declarations
+    /// of this kind; guessing between two would expand one type's runtime onto
+    /// the other.
     pub fn resolve<'source>(
         &self,
         contract: &SourceContract,
         source_file: impl Fn(&str) -> Option<&'source SourceFile>,
     ) -> Option<DataId> {
-        match self.kind {
-            DeclarationKind::Record => contract
-                .records
-                .iter()
-                .find(|record| {
-                    self.matches_contract_declaration(
-                        record.id.as_str(),
-                        record.name.spelling(),
-                        record.source_span.as_ref(),
-                        source_file(record.id.as_str()),
-                    )
-                })
-                .map(|record| DataId::Record(record.id.clone())),
-            DeclarationKind::Enumeration => contract
-                .enums
-                .iter()
-                .find(|enumeration| {
-                    self.matches_contract_declaration(
-                        enumeration.id.as_str(),
-                        enumeration.name.spelling(),
-                        enumeration.source_span.as_ref(),
-                        source_file(enumeration.id.as_str()),
-                    )
-                })
-                .map(|enumeration| DataId::Enumeration(enumeration.id.clone())),
+        let mut candidates: Box<dyn Iterator<Item = DataId>> = match self.kind {
+            DeclarationKind::Record => Box::new(
+                contract
+                    .records
+                    .iter()
+                    .filter(|record| {
+                        self.matches_contract_declaration(
+                            record.id.as_str(),
+                            record.name.spelling(),
+                            record.source_span.as_ref(),
+                            source_file(record.id.as_str()),
+                        )
+                    })
+                    .map(|record| DataId::Record(record.id.clone())),
+            ),
+            DeclarationKind::Enumeration => Box::new(
+                contract
+                    .enums
+                    .iter()
+                    .filter(|enumeration| {
+                        self.matches_contract_declaration(
+                            enumeration.id.as_str(),
+                            enumeration.name.spelling(),
+                            enumeration.source_span.as_ref(),
+                            source_file(enumeration.id.as_str()),
+                        )
+                    })
+                    .map(|enumeration| DataId::Enumeration(enumeration.id.clone())),
+            ),
+        };
+        let first = candidates.next();
+        match self.source {
+            None if candidates.next().is_some() => None,
+            _ => first,
         }
     }
 
@@ -421,18 +447,17 @@ impl Declaration {
         if name != self.name {
             return false;
         }
+        let Some(source) = &self.source else {
+            return true;
+        };
         self.local_scope.is_some()
             || self.matches_module(id)
-                && (span.is_some_and(|span| self.matches_source(span))
-                    || source_file.is_some_and(|source_file| self.matches_source_file(source_file)))
+                && (span.is_some_and(|span| Self::same_file(&span.file, source))
+                    || source_file.is_some_and(|source_file| Self::same_file(source_file, source)))
     }
 
-    fn matches_source(&self, span: &SourceSpan) -> bool {
-        self.matches_source_file(&span.file)
-    }
-
-    fn matches_source_file(&self, source_file: &SourceFile) -> bool {
-        Self::canonical(Path::new(source_file.as_str())) == Self::canonical(&self.source)
+    fn same_file(source_file: &SourceFile, source: &Path) -> bool {
+        Self::canonical(Path::new(source_file.as_str())) == Self::canonical(source)
     }
 
     fn matches_module(&self, id: &str) -> bool {
@@ -536,8 +561,52 @@ impl<'syntax> Visit<'syntax> for ScopeFinder<'_> {
 
 #[cfg(test)]
 mod tests {
-    use super::{DeclarationKind, FileIndex, Scope, ScopeFinder};
+    use super::{DataId, Declaration, DeclarationKind, FileIndex, Scope, ScopeFinder};
+    use boltffi_ast::PackageInfo;
     use proc_macro2::LineColumn;
+
+    /// rust-analyzer's expander cannot name the invoking file, which left
+    /// every `#[data]` a macro error in the IDE. The name alone still picks the
+    /// declaration out when no other of that kind shares it.
+    #[test]
+    fn resolves_an_unlocated_declaration_by_a_unique_name() {
+        let contract = boltffi_scan::scan_file(
+            syn::parse_quote! {
+                #[data]
+                pub struct Point { pub x: f64 }
+                #[data]
+                pub enum Shape { Circle }
+                pub mod first {
+                    #[data]
+                    pub struct Pair { pub a: u32 }
+                }
+                pub mod second {
+                    #[data]
+                    pub struct Pair { pub b: u32 }
+                }
+            },
+            PackageInfo::new("demo", None),
+        )
+        .expect("contract scans");
+        let resolve = |name: &str, kind| {
+            Declaration::unlocated(name.to_owned(), kind).resolve(&contract, |_| None)
+        };
+
+        assert!(matches!(
+            resolve("Point", DeclarationKind::Record),
+            Some(DataId::Record(id)) if id.as_str().ends_with("Point")
+        ));
+        assert!(matches!(
+            resolve("Shape", DeclarationKind::Enumeration),
+            Some(DataId::Enumeration(id)) if id.as_str().ends_with("Shape")
+        ));
+        assert!(resolve("Shape", DeclarationKind::Record).is_none());
+        assert!(
+            resolve("Pair", DeclarationKind::Record).is_none(),
+            "an ambiguous name must not guess",
+        );
+        assert!(resolve("Missing", DeclarationKind::Record).is_none());
+    }
 
     /// `source_offset` feeds `declaration_ordinal`, and the two agree only if
     /// the offset lands inside the identifier.

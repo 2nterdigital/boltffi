@@ -225,11 +225,16 @@ impl BuildContext {
         if let Some(id) = declaration.resolve(&self.support, |id| self.data_source_files.get(id)) {
             return self.render_support_data_id(id);
         }
-        let contract =
-            boltffi_scan::scan_source(declaration.source(), self.request.package.clone())?;
+        // With no file to scan (rust-analyzer's expander), a declaration the
+        // crate-wide contract cannot name uniquely is left as written: an IDE
+        // expansion without its runtime is better than none at all.
+        let Some(source) = declaration.source() else {
+            return Ok(TokenStream::new());
+        };
+        let contract = boltffi_scan::scan_source(source, self.request.package.clone())?;
         let root_types = RootModuleTypes::with_visible_paths(&contract.package, std::iter::empty());
         let contract = root_types.contract(&contract);
-        let source_file = SourceFile::new(declaration.source().display().to_string());
+        let source_file = SourceFile::new(source.display().to_string());
         let id = declaration
             .resolve(&contract, |_| Some(&source_file))
             .ok_or_else(|| BuildError::MissingData(declaration.name().to_owned()))?;
