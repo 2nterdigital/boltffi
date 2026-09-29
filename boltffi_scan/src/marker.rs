@@ -80,6 +80,9 @@ impl Marker {
     }
 
     fn from_attribute(attr: &syn::Attribute) -> Result<Option<Self>, ScanError> {
+        if is_thiserror_message(attr) {
+            return Ok(None);
+        }
         match marker_name(attr).as_deref() {
             Some("data") => Self::from_data(attr).map(Some),
             Some("custom_ffi") => Self::empty(attr, Self::CustomFfi).map(Some),
@@ -134,6 +137,15 @@ impl ExportMarker {
             class_thread_safety: Some(ClassThreadSafety::UnsafeSingleThreaded),
         }
     }
+}
+
+/// `thiserror`'s derive helper — `#[error("…")]` / `#[error(transparent)]` —
+/// shares the bare `error` name with BoltFFI's argument-less `#[error]`
+/// marker. A bare `error` WITH arguments is thiserror's and not a marker, so
+/// a crate can keep its thiserror messages next to BoltFFI markers;
+/// `boltffi::error(…)` with arguments is still an invalid marker.
+pub(crate) fn is_thiserror_message(attr: &syn::Attribute) -> bool {
+    attr.path().is_ident("error") && !matches!(attr.meta, syn::Meta::Path(_))
 }
 
 fn parse_data_impl(input: syn::parse::ParseStream<'_>) -> syn::Result<()> {
@@ -308,6 +320,19 @@ mod tests {
             Marker::detect(&enum_attrs("#[boltffi::error] enum E { Io, Parse }")),
             Ok(Some(Marker::Error))
         );
+    }
+
+    #[test]
+    fn thiserror_messages_are_not_error_markers() {
+        assert_eq!(
+            Marker::detect(&struct_attrs("#[error(\"invalid encoding\")] struct E;")),
+            Ok(None)
+        );
+        assert_eq!(
+            Marker::detect(&enum_attrs("#[error(transparent)] enum E { Io }")),
+            Ok(None)
+        );
+        assert!(Marker::detect(&struct_attrs("#[boltffi::error(\"x\")] struct E;")).is_err());
     }
 
     #[test]
