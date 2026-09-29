@@ -448,6 +448,10 @@ impl ExportDetector {
                         .any(|nested| Self::meta_names_marker(nested, names))
                 });
         }
+        // A bare `error(…)` is thiserror's message, not BoltFFI's `#[error]`.
+        if meta.path().is_ident("error") && !matches!(meta, syn::Meta::Path(_)) {
+            return false;
+        }
         meta.path()
             .segments
             .last()
@@ -495,5 +499,18 @@ mod tests {
         )
         .expect("valid item");
         assert!(!ExportDetector::file_has_exports(&unrelated));
+    }
+
+    #[test]
+    fn thiserror_messages_are_not_error_markers() {
+        let thiserror = syn::parse_str::<syn::File>(
+            "#[derive(Debug, thiserror::Error)] #[error(\"invalid encoding\")] pub struct Invalid;",
+        )
+        .expect("valid item");
+        assert!(!ExportDetector::file_has_exports(&thiserror));
+
+        let marker =
+            syn::parse_str::<syn::File>("#[error] pub enum Failure { A }").expect("valid item");
+        assert!(ExportDetector::file_has_exports(&marker));
     }
 }
