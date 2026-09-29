@@ -4,7 +4,10 @@ use proc_macro2::TokenStream;
 use quote::ToTokens;
 use syn::parse::Parser;
 use syn::punctuated::Punctuated;
-use syn::{Attribute, Expr, Lit, Meta, MetaList, MetaNameValue, Path, Token};
+use syn::{
+    Attribute, Expr, Fields, ImplItem, Item, Lit, Meta, MetaList, MetaNameValue, Path, Token,
+    TraitItem,
+};
 
 use crate::ScanError;
 
@@ -57,6 +60,115 @@ impl ActiveCfg {
             .or_default()
             .insert(value.into());
         self
+    }
+
+    /// Expands every `#[cfg_attr(predicate, attrs…)]` in `items` (fields,
+    /// variants and impl / trait items included): an active one is replaced
+    /// by its nested attributes, recursively; an inactive one is dropped.
+    ///
+    /// A BoltFFI marker behind a feature — `#[cfg_attr(feature = "boltffi",
+    /// boltffi::data)]` — is then scanned exactly like the bare attribute,
+    /// which is what lets a crate keep its FFI markers optional the way it
+    /// would with `cfg_attr(feature = "uniffi", derive(uniffi::Record))`. A
+    /// nested `cfg(...)` keeps gating the item as before.
+    pub(crate) fn expand_cfg_attrs(&self, items: &mut [Item]) -> Result<(), ScanError> {
+        items.iter_mut().try_for_each(|item| self.expand_item(item))
+    }
+
+    fn expand_item(&self, item: &mut Item) -> Result<(), ScanError> {
+        match item {
+            Item::Struct(item) => {
+                self.expand_attrs(&mut item.attrs)?;
+                self.expand_fields(&mut item.fields)
+            }
+            Item::Enum(item) => {
+                self.expand_attrs(&mut item.attrs)?;
+                item.variants.iter_mut().try_for_each(|variant| {
+                    self.expand_attrs(&mut variant.attrs)?;
+                    self.expand_fields(&mut variant.fields)
+                })
+            }
+            Item::Impl(item) => {
+                self.expand_attrs(&mut item.attrs)?;
+                item.items.iter_mut().try_for_each(|item| match item {
+                    ImplItem::Fn(item) => self.expand_attrs(&mut item.attrs),
+                    ImplItem::Const(item) => self.expand_attrs(&mut item.attrs),
+                    ImplItem::Type(item) => self.expand_attrs(&mut item.attrs),
+                    ImplItem::Macro(item) => self.expand_attrs(&mut item.attrs),
+                    _ => Ok(()),
+                })
+            }
+            Item::Trait(item) => {
+                self.expand_attrs(&mut item.attrs)?;
+                item.items.iter_mut().try_for_each(|item| match item {
+                    TraitItem::Fn(item) => self.expand_attrs(&mut item.attrs),
+                    TraitItem::Const(item) => self.expand_attrs(&mut item.attrs),
+                    TraitItem::Type(item) => self.expand_attrs(&mut item.attrs),
+                    TraitItem::Macro(item) => self.expand_attrs(&mut item.attrs),
+                    _ => Ok(()),
+                })
+            }
+            Item::Mod(item) => {
+                self.expand_attrs(&mut item.attrs)?;
+                match &mut item.content {
+                    Some((_, items)) => self.expand_cfg_attrs(items),
+                    None => Ok(()),
+                }
+            }
+            Item::Fn(item) => self.expand_attrs(&mut item.attrs),
+            Item::Const(item) => self.expand_attrs(&mut item.attrs),
+            Item::Static(item) => self.expand_attrs(&mut item.attrs),
+            Item::Type(item) => self.expand_attrs(&mut item.attrs),
+            Item::Macro(item) => self.expand_attrs(&mut item.attrs),
+            Item::Use(item) => self.expand_attrs(&mut item.attrs),
+            _ => Ok(()),
+        }
+    }
+
+    fn expand_fields(&self, fields: &mut Fields) -> Result<(), ScanError> {
+        fields
+            .iter_mut()
+            .try_for_each(|field| self.expand_attrs(&mut field.attrs))
+    }
+
+    fn expand_attrs(&self, attrs: &mut Vec<Attribute>) -> Result<(), ScanError> {
+        if !attrs.iter().any(|attr| attr.path().is_ident("cfg_attr")) {
+            return Ok(());
+        }
+        let mut expanded = Vec::with_capacity(attrs.len());
+        for attr in attrs.drain(..) {
+            self.expand_attr(attr, &mut expanded)?;
+        }
+        *attrs = expanded;
+        Ok(())
+    }
+
+    fn expand_attr(&self, attr: Attribute, expanded: &mut Vec<Attribute>) -> Result<(), ScanError> {
+        if !attr.path().is_ident("cfg_attr") {
+            expanded.push(attr);
+            return Ok(());
+        }
+        let Meta::List(list) = &attr.meta else {
+            return Err(Self::invalid_attribute(attr.meta.to_token_stream()));
+        };
+        let metas = self.predicates(list)?;
+        let (predicate, nested) = metas
+            .split_first()
+            .ok_or_else(|| Self::invalid_attribute(list.to_token_stream()))?;
+        if !self.matches_meta(predicate)? {
+            return Ok(());
+        }
+        nested.iter().try_for_each(|meta| {
+            self.expand_attr(
+                Attribute {
+                    pound_token: attr.pound_token,
+                    style: attr.style,
+                    bracket_token: attr.bracket_token,
+                    meta: meta.clone(),
+                },
+                expanded,
+            )
+        })
     }
 
     pub fn matches_attrs(&self, attrs: &[Attribute]) -> Result<bool, ScanError> {
@@ -389,6 +501,93 @@ mod tests {
 
         assert!(!matches(&inactive, source));
         assert!(matches(&active, source));
+    }
+
+    fn expanded(active: &ActiveCfg, source: &str) -> syn::File {
+        let mut file = syn::parse_str::<syn::File>(source).expect("valid items");
+        active
+            .expand_cfg_attrs(&mut file.items)
+            .expect("cfg_attr expansion");
+        file
+    }
+
+    fn attr_paths(attrs: &[syn::Attribute]) -> Vec<String> {
+        attrs
+            .iter()
+            .map(|attr| {
+                quote::ToTokens::to_token_stream(attr.path())
+                    .to_string()
+                    .replace(' ', "")
+            })
+            .collect()
+    }
+
+    #[test]
+    fn active_cfg_attr_marker_becomes_the_bare_attribute() {
+        let source = "#[derive(Clone)] #[cfg_attr(feature = \"boltffi\", boltffi::data, repr(i32))] enum Mode { A }";
+        let file = expanded(&ActiveCfg::default().with_feature("boltffi"), source);
+        let syn::Item::Enum(item) = &file.items[0] else {
+            panic!("expected enum")
+        };
+        assert_eq!(
+            attr_paths(&item.attrs),
+            vec!["derive", "boltffi::data", "repr"]
+        );
+    }
+
+    #[test]
+    fn inactive_cfg_attr_marker_is_dropped() {
+        let source = "#[cfg_attr(feature = \"boltffi\", boltffi::data)] struct Point { x: f64 }";
+        let file = expanded(&ActiveCfg::default(), source);
+        let syn::Item::Struct(item) = &file.items[0] else {
+            panic!("expected struct")
+        };
+        assert!(item.attrs.is_empty());
+    }
+
+    #[test]
+    fn cfg_attr_expands_inside_fields_variants_impls_and_inline_modules() {
+        let source = "mod inner {\n\
+            #[cfg_attr(feature = \"ffi\", boltffi::data)] enum E { #[cfg_attr(feature = \"ffi\", boltffi::skip)] A { #[cfg_attr(feature = \"ffi\", boltffi::skip)] x: u8 } }\n\
+            #[cfg_attr(feature = \"ffi\", boltffi::export)] impl S { #[cfg_attr(feature = \"ffi\", boltffi::skip)] fn f(&self) {} }\n\
+            }";
+        let file = expanded(&ActiveCfg::default().with_feature("ffi"), source);
+        let syn::Item::Mod(module) = &file.items[0] else {
+            panic!("expected mod")
+        };
+        let items = &module.content.as_ref().expect("inline module").1;
+        let syn::Item::Enum(item) = &items[0] else {
+            panic!("expected enum")
+        };
+        assert_eq!(attr_paths(&item.attrs), vec!["boltffi::data"]);
+        let variant = &item.variants[0];
+        assert_eq!(attr_paths(&variant.attrs), vec!["boltffi::skip"]);
+        assert_eq!(
+            attr_paths(&variant.fields.iter().next().expect("field").attrs),
+            vec!["boltffi::skip"]
+        );
+        let syn::Item::Impl(item) = &items[1] else {
+            panic!("expected impl")
+        };
+        assert_eq!(attr_paths(&item.attrs), vec!["boltffi::export"]);
+        let syn::ImplItem::Fn(method) = &item.items[0] else {
+            panic!("expected fn")
+        };
+        assert_eq!(attr_paths(&method.attrs), vec!["boltffi::skip"]);
+    }
+
+    #[test]
+    fn nested_cfg_attr_expands_to_a_cfg_that_still_gates_the_item() {
+        let active = ActiveCfg::default().with_feature("ffi");
+        let file = expanded(
+            &active,
+            "#[cfg_attr(feature = \"ffi\", cfg_attr(all(), cfg(any())))] struct Gone;",
+        );
+        let syn::Item::Struct(item) = &file.items[0] else {
+            panic!("expected struct")
+        };
+        assert_eq!(attr_paths(&item.attrs), vec!["cfg"]);
+        assert!(!active.matches_attrs(&item.attrs).expect("cfg evaluation"));
     }
 
     #[test]

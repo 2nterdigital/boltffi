@@ -102,7 +102,11 @@ fn walk(
     cfg: &ActiveCfg,
 ) -> Result<Vec<SourceModule>, ScanError> {
     let spans = file.spans;
-    let (own_items, mut child_modules) = file.items.into_iter().try_fold(
+    let mut items = file.items;
+    // A feature-gated marker (`#[cfg_attr(feature = "…", boltffi::data)]`)
+    // must be seen like the bare attribute by everything below.
+    cfg.expand_cfg_attrs(&mut items)?;
+    let (own_items, mut child_modules) = items.into_iter().try_fold(
         (Vec::new(), Vec::new()),
         |(mut own_items, mut child_modules), mut item| {
             if !cfg.matches_item(&item)? {
