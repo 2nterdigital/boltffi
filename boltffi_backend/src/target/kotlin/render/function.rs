@@ -623,9 +623,9 @@ impl ExportedParameter {
         }
     }
 
-    /// The Kotlin spelling of the parameter's default. `null` needs no type
-    /// (lowering admits it on `Option`s only); anything else is rendered
-    /// against the value type the parameter crosses as.
+    /// The Kotlin spelling of the parameter's default, rendered against the
+    /// value type the parameter crosses as. A closure has none: its only
+    /// default is `null`, which lowering admits on an optional one alone.
     fn default_for(
         parameter: &ParamDecl<Native, IntoRust>,
         context: &RenderContext<Native>,
@@ -633,11 +633,11 @@ impl ExportedParameter {
         let Some(value) = parameter.meta().default() else {
             return Ok(None);
         };
-        if matches!(value, DefaultValue::Null) {
-            return Ok(Some(Expression::null()));
-        }
         let ty = match parameter.payload() {
             IncomingParam::Value(plan) => plan.value_type(),
+            IncomingParam::Closure(_) if matches!(value, DefaultValue::Null) => {
+                return Ok(Some(Expression::null()));
+            }
             IncomingParam::Closure(_) => None,
         }
         .ok_or_else(|| KotlinHost::unsupported("default value for this parameter type"))?;

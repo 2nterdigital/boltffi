@@ -12,3 +12,18 @@ impl Ledger {
         self.balance
     }
 }
+
+pub struct Tally {
+    count: u64,
+}
+
+#[export]
+impl Tally {
+    pub fn new(count: u64) -> Self {
+        Self { count }
+    }
+
+    pub fn count(&self) -> u64 {
+        self.count
+    }
+}

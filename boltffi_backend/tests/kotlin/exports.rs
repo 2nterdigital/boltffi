@@ -139,25 +139,35 @@ fn kotlin_target_overrides_exception_messages() {
     insta::assert_snapshot!(rendered_fixture("enums/error_message"));
 }
 
-#[test]
-fn kotlin_exception_messages_compile_and_preserve_payloads() {
+fn kotlin_compiler() -> Option<&'static str> {
     let compiler = if cfg!(windows) {
         "kotlinc.bat"
     } else {
         "kotlinc"
     };
-    if Command::new(compiler).arg("-version").output().is_err() {
-        eprintln!("Kotlin compiler is unavailable; exception runtime coverage runs in the demo");
-        return;
-    }
+    Command::new(compiler)
+        .arg("-version")
+        .output()
+        .is_ok()
+        .then_some(compiler)
+}
 
+/// Compiles the Kotlin rendered for `source` together with `caller`, written
+/// as `caller_file`, and runs the caller's `main`.
+fn run_with_generated_kotlin(
+    compiler: &str,
+    label: &str,
+    source: &str,
+    caller_file: &str,
+    caller: &str,
+) {
     let directory = env::temp_dir().join(format!(
-        "boltffi-kotlin-error-messages-{}-{}",
+        "boltffi-kotlin-{label}-{}-{}",
         std::process::id(),
         UNIX_EPOCH.elapsed().expect("system clock").as_nanos()
     ));
     fs::create_dir_all(&directory).expect("create Kotlin test directory");
-    let source_paths = super::files(&fixture("enums/error_message"))
+    let source_paths = super::files(source)
         .into_iter()
         .filter(|(path, _)| path.ends_with(".kt"))
         .map(|(path, source)| {
@@ -168,16 +178,12 @@ fn kotlin_exception_messages_compile_and_preserve_payloads() {
             path
         })
         .collect::<Vec<_>>();
-    let assertions = directory.join("ErrorMessages.kt");
-    fs::write(
-        &assertions,
-        include_str!("../fixtures/kotlin/error_messages.kt"),
-    )
-    .expect("write Kotlin assertions");
-    let jar = directory.join("errors.jar");
+    let caller_path = directory.join(caller_file);
+    fs::write(&caller_path, caller).expect("write Kotlin caller");
+    let jar = directory.join(format!("{label}.jar"));
     let compilation = Command::new(compiler)
         .args(&source_paths)
-        .arg(assertions)
+        .arg(caller_path)
         .args(["-include-runtime", "-d"])
         .arg(&jar)
         .output()
@@ -193,14 +199,30 @@ fn kotlin_exception_messages_compile_and_preserve_payloads() {
         .arg("-jar")
         .arg(jar)
         .output()
-        .expect("run Kotlin assertions");
+        .expect("run Kotlin caller");
     assert!(
         execution.status.success(),
-        "Kotlin exception assertions failed:\n{}\n{}",
+        "Kotlin {label} assertions failed:\n{}\n{}",
         String::from_utf8_lossy(&execution.stdout),
         String::from_utf8_lossy(&execution.stderr)
     );
     fs::remove_dir_all(directory).expect("remove Kotlin test directory");
+}
+
+#[test]
+fn kotlin_exception_messages_compile_and_preserve_payloads() {
+    let Some(compiler) = kotlin_compiler() else {
+        eprintln!("Kotlin compiler is unavailable; exception runtime coverage runs in the demo");
+        return;
+    };
+
+    run_with_generated_kotlin(
+        compiler,
+        "error-messages",
+        &fixture("enums/error_message"),
+        "ErrorMessages.kt",
+        include_str!("../fixtures/kotlin/error_messages.kt"),
+    );
 }
 
 #[test]
@@ -558,4 +580,50 @@ fn kotlin_target_keeps_a_long_initializer_off_the_handle_constructor_signature()
     assert!(rendered.contains("class Ledger internal constructor(internal val handle: Long)"));
     assert!(!rendered.contains("constructor(balance: Long)"));
     assert!(rendered.contains("fun new(balance: Long): Ledger"));
+    // so would `constructor(count: ULong)`: both take a JVM `long`
+    assert!(rendered.contains("class Tally internal constructor(internal val handle: Long)"));
+    assert!(!rendered.contains("constructor(count: ULong)"));
+    assert!(rendered.contains("fun new(count: ULong): Tally"));
+}
+
+#[test]
+fn kotlin_target_writes_integer_limit_defaults_as_literals_kotlin_accepts() {
+    let rendered = rendered_fixture("exports/integer_limit_defaults");
+
+    assert!(rendered.contains("val floor: Long = Long.MIN_VALUE"));
+    assert!(rendered.contains("val ceiling: ULong = 18446744073709551615uL"));
+    assert!(rendered.contains("val start: Long = Long.MIN_VALUE,"));
+    assert!(rendered.contains("val end: ULong = 18446744073709551615uL"));
+    assert!(rendered.contains(
+        "fun span(start: Long = Long.MIN_VALUE, end: ULong = 18446744073709551615uL): ULong"
+    ));
+}
+
+#[test]
+fn kotlin_target_defaults_a_custom_type_represented_as_an_option_to_null() {
+    let rendered = rendered_fixture("exports/optional_custom_defaults");
+
+    assert!(rendered.contains("val limit: UInt? = null"));
+    assert!(rendered.contains("fun throttle(limit: UInt? = null): UInt?"));
+}
+
+#[test]
+fn kotlin_generated_defaults_and_long_initializers_compile() {
+    let Some(compiler) = kotlin_compiler() else {
+        eprintln!("Kotlin compiler is unavailable; default-argument coverage runs in the demo");
+        return;
+    };
+
+    run_with_generated_kotlin(
+        compiler,
+        "defaults",
+        &SourceFixture::many([
+            "exports/integer_limit_defaults",
+            "exports/optional_custom_defaults",
+            "exports/long_initializer",
+        ])
+        .read(),
+        "DefaultsAndInitializers.kt",
+        include_str!("../fixtures/kotlin/defaults_and_initializers.kt"),
+    );
 }
