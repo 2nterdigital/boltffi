@@ -422,13 +422,36 @@ impl ExportDetector {
         }
     }
 
+    /// Whether a marker in `names` is on the item — bare, or behind any
+    /// `cfg_attr` (whether that predicate is active is decided later, when
+    /// the package is scanned with its resolved features; here a crate whose
+    /// markers are all feature-gated must still count as exporting).
     fn has_any_attribute(attrs: &[Attribute], names: &[&str]) -> bool {
-        attrs.iter().any(|attr| {
-            attr.path()
-                .segments
-                .last()
-                .is_some_and(|segment| names.iter().any(|name| segment.ident == *name))
-        })
+        attrs
+            .iter()
+            .any(|attr| Self::meta_names_marker(&attr.meta, names))
+    }
+
+    fn meta_names_marker(meta: &syn::Meta, names: &[&str]) -> bool {
+        if meta.path().is_ident("cfg_attr") {
+            let syn::Meta::List(list) = meta else {
+                return false;
+            };
+            return list
+                .parse_args_with(
+                    syn::punctuated::Punctuated::<syn::Meta, syn::Token![,]>::parse_terminated,
+                )
+                .is_ok_and(|metas| {
+                    metas
+                        .iter()
+                        .skip(1)
+                        .any(|nested| Self::meta_names_marker(nested, names))
+                });
+        }
+        meta.path()
+            .segments
+            .last()
+            .is_some_and(|segment| names.iter().any(|name| segment.ident == *name))
     }
 
     fn has_ffi_type_derive(attrs: &[Attribute]) -> bool {
@@ -453,4 +476,24 @@ impl ExportDetector {
 
 fn cargo_crate_name(package_or_target_name: &str) -> String {
     package_or_target_name.replace('-', "_")
+}
+
+#[cfg(test)]
+mod tests {
+    use super::ExportDetector;
+
+    #[test]
+    fn feature_gated_markers_count_as_exports() {
+        let gated = syn::parse_str::<syn::File>(
+            "#[cfg_attr(feature = \"ffi\", boltffi::data)] pub struct Point { pub x: f64 }",
+        )
+        .expect("valid item");
+        assert!(ExportDetector::file_has_exports(&gated));
+
+        let unrelated = syn::parse_str::<syn::File>(
+            "#[cfg_attr(feature = \"ffi\", derive(Debug))] pub struct Point { pub x: f64 }",
+        )
+        .expect("valid item");
+        assert!(!ExportDetector::file_has_exports(&unrelated));
+    }
 }
